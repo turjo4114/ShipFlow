@@ -1,0 +1,58 @@
+### Works with the VS Code "REST Client" extension or JetBrains HTTP client.
+@host = http://localhost:8080
+@tenant = ACME
+
+### Health
+GET {{host}}/health/ready
+
+### Products
+GET {{host}}/api/products
+X-Tenant-Code: {{tenant}}
+
+### Create a product
+POST {{host}}/api/products
+X-Tenant-Code: {{tenant}}
+Content-Type: application/json
+
+{ "sku": "SKU-9001", "name": "Strapping Band", "unitOfMeasure": "ROLL" }
+
+### Warehouses
+GET {{host}}/api/warehouses
+X-Tenant-Code: {{tenant}}
+
+### Record a receipt (positive quantity; server signs it)
+POST {{host}}/api/stock-movements
+X-Tenant-Code: {{tenant}}
+Content-Type: application/json
+
+{ "warehouseId": 1, "productId": 1, "movementType": "RECEIPT", "quantity": 25, "referenceNo": "PO-1001" }
+
+### Record an issue (outbound)
+POST {{host}}/api/stock-movements
+X-Tenant-Code: {{tenant}}
+Content-Type: application/json
+
+{ "warehouseId": 1, "productId": 1, "movementType": "ISSUE", "quantity": 10, "referenceNo": "SO-2002" }
+
+### Stock sheet with running balance (window function)
+GET {{host}}/api/stock/sheet?warehouseId=1&productId=1
+X-Tenant-Code: {{tenant}}
+
+### On-hand snapshot with per-warehouse share
+GET {{host}}/api/stock/on-hand
+X-Tenant-Code: {{tenant}}
+
+### Queue a bulk logistics update (ids from the movements list)
+POST {{host}}/api/logistics/bulk-update
+X-Tenant-Code: {{tenant}}
+Content-Type: application/json
+
+{ "movementIds": [1, 2, 3] }
+
+### Outbox status (pending / processing / done / dead)
+GET {{host}}/api/ops/outbox
+X-Tenant-Code: {{tenant}}
+
+### Tenant isolation check: GLOBEX must not see ACME's data
+GET {{host}}/api/products
+X-Tenant-Code: GLOBEX

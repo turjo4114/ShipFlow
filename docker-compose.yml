@@ -1,0 +1,71 @@
+name: shipflow
+
+services:
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: shipflow-sql
+    restart: unless-stopped
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_PID: Developer
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:?Set MSSQL_SA_PASSWORD in .env}
+    volumes:
+      - sqldata:/var/opt/mssql
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -Q 'SELECT 1' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks: [backend]          # NOT on edge: unreachable from outside
+
+  # One-shot job: applies db/init/*.sql in filename order, then exits. Scripts are idempotent.
+  db-init:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: shipflow-db-init
+    restart: "no"
+    depends_on:
+      sqlserver:
+        condition: service_healthy
+    environment:
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD}
+    volumes:
+      - ./db:/db:ro
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        for f in /db/init/*.sql; do
+          echo ">> applying $$f"
+          /opt/mssql-tools18/bin/sqlcmd -C -I -b -S sqlserver -U sa -P "$$MSSQL_SA_PASSWORD" -i "$$f"
+        done
+        echo ">> database ready"
+    networks: [backend]
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: shipflow-api
+    restart: unless-stopped
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+    environment:
+      ASPNETCORE_ENVIRONMENT: ${ASPNETCORE_ENVIRONMENT:-Development}
+      # "sqlserver" resolves via Docker DNS on the backend network. Pool settings = enterprise pooling.
+      ConnectionStrings__ShipFlow: "Server=sqlserver,1433;Database=ShipFlow;User Id=sa;Password=${MSSQL_SA_PASSWORD};TrustServerCertificate=True;Encrypt=True;Min Pool Size=5;Max Pool Size=100;Connect Timeout=15;Application Name=ShipFlow.Api"
+      Carrier__BaseUrl: ${CARRIER_BASE_URL:-http://localhost:8080}
+      Carrier__EnableMock: ${CARRIER_ENABLE_MOCK:-true}
+      Carrier__MockFailureRate: ${CARRIER_MOCK_FAILURE_RATE:-0.3}
+    ports:
+      - "8080:8080"
+    networks: [edge, backend]
+
+networks:
+  edge:
+  backend:
+    internal: true
+
+volumes:
+  sqldata:

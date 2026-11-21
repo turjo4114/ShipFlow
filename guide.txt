@@ -1,0 +1,225 @@
+=====================================================================
+ SHIPFLOW - SETUP & CONFIGURATION GUIDE
+=====================================================================
+Stack: .NET 8 Web API | EF Core + Dapper | SQL Server 2022 | Docker Compose | Polly resilience
+
+NOTE: The code was written without compiling it (no .NET SDK / NuGet access where
+it was generated). Expect to possibly fix a typo or two on first build - see
+section 11 for how to check quickly.
+
+---------------------------------------------------------------------
+1. WHAT YOU NEED
+---------------------------------------------------------------------
+- Docker Desktop (Windows/macOS) or Docker Engine + Compose v2 (Linux)
+- ~4 GB RAM free for Docker (SQL Server needs at least 2 GB)
+- OPTIONAL for editing/running outside Docker: .NET 8 SDK
+- OPTIONAL: SSMS or Azure Data Studio; VS Code + "REST Client" extension
+
+---------------------------------------------------------------------
+2. FIRST RUN (3 commands)
+---------------------------------------------------------------------
+  cp .env.example .env          (Windows PowerShell: copy .env.example .env)
+  -> OPEN .env AND CHANGE MSSQL_SA_PASSWORD  (8+ chars, upper+lower+digit+symbol)
+  docker compose up --build
+
+What happens, in order:
+  1. sqlserver starts and becomes "healthy"
+  2. db-init applies db/init/*.sql (database, schema, reporting functions, dev seed) and exits
+  3. api starts; Swagger at http://localhost:8080/swagger
+
+Verify:
+  http://localhost:8080/health/live    -> {"status":"alive"}
+  http://localhost:8080/health/ready   -> shows database + SQL version
+
+Stop:               docker compose down
+Stop + wipe data:   docker compose down -v
+
+---------------------------------------------------------------------
+3. THINGS YOU MAY NEED TO CONFIGURE
+---------------------------------------------------------------------
+A) .env  (the only file you MUST edit)
+   MSSQL_SA_PASSWORD         SQL "sa" password. Required. Must meet SQL Server complexity,
+                             otherwise the sqlserver container exits immediately.
+                             Avoid the characters  $  "  \  in it (breaks shell/compose quoting).
+   ASPNETCORE_ENVIRONMENT    Development (Swagger on) | Production (Swagger off)
+   CARRIER_BASE_URL          External carrier API root. Default = the API's own mock endpoint.
+   CARRIER_ENABLE_MOCK       true/false. Set false once CARRIER_BASE_URL is a real carrier.
+   CARRIER_MOCK_FAILURE_RATE 0.0 to 1.0 - how often the mock returns HTTP 503 (for demos).
+
+B) Ports
+   API is published on 8080. If taken, change "8080:8080" in docker-compose.yml
+   (left number only) and the Carrier base URL if you use the mock.
+   SQL is published on 127.0.0.1:1433 ONLY by docker-compose.override.yml (dev convenience).
+   If you already run local SQL Server on 1433, change it to e.g. "127.0.0.1:14333:1433".
+
+C) Apple Silicon (M1/M2/M3) Macs
+   SQL Server 2022 image is x86. Enable "Use Rosetta for x86/amd64 emulation" in Docker
+   Desktop, and add  platform: linux/amd64  under the sqlserver and db-init services.
+
+D) Application settings (src/ShipFlow.Api/appsettings.json, or env vars with "__")
+   Outbox:PollSeconds / BatchSize / LockMinutes / MaxAttempts    (env: Outbox__MaxAttempts=...)
+   Carrier:BaseUrl / EnableMock / MockFailureRate
+   ConnectionStrings:ShipFlow - pool tuning is in the string: Min Pool Size / Max Pool Size.
+   (docker-compose.yml overrides the connection string for the container; the value in
+    appsettings.json is only for running the API directly on your machine.)
+
+E) Resilience tuning (code: src/ShipFlow.Api/Program.cs, "carrier-pipeline")
+   Retry: 4 attempts, 0.5s exponential + jitter. Breaker: opens at >=50% failures over 30s
+   (min 8 calls), stays open 30s. Timeouts: 5s per attempt, 30s total. Change to taste.
+
+---------------------------------------------------------------------
+4. TRY THE API
+---------------------------------------------------------------------
+Every /api call needs the header:   X-Tenant-Code: ACME     (or GLOBEX)
+Seeded: tenants ACME and GLOBEX; ACME has 2 warehouses, 5 products, ledger history.
+
+Easiest: open requests.http in VS Code (REST Client) and click "Send Request".
+Or Swagger: click "Authorize", type ACME in the Tenant box.
+Or curl:
+  curl -H "X-Tenant-Code: ACME" http://localhost:8080/api/products
+  curl -H "X-Tenant-Code: ACME" -H "Content-Type: application/json" \
+       -d '{"warehouseId":1,"productId":1,"movementType":"RECEIPT","quantity":25}' \
+       http://localhost:8080/api/stock-movements
+  curl -H "X-Tenant-Code: ACME" "http://localhost:8080/api/stock/sheet?warehouseId=1&productId=1"
+  curl -H "X-Tenant-Code: GLOBEX" http://localhost:8080/api/products     <- must NOT show ACME's data
+
+Movement types: RECEIPT, ISSUE, TRANSFER_IN, TRANSFER_OUT (send a POSITIVE quantity; the server
+signs it) and ADJUSTMENT (send a signed quantity, e.g. -2).
+
+---------------------------------------------------------------------
+5. PHASE 2 - DATABASE & T-SQL
+---------------------------------------------------------------------
+Files (db/init, applied automatically, idempotent - safe to re-run):
+  001_create_database.sql   database (RCSI intentionally OFF)
+  002_schema.sql            Tenants, Warehouses, Products, StockMovements, OutboxMessages + indexes
+  003_stock_reporting.sql   tvf_StockSheet (SUM() OVER running balance), tvf_StockOnHand
+  004_seed_dev.sql          dev data. DELETE or gate this file for production.
+
+To re-apply init scripts after editing:   docker compose run --rm db-init
+
+Run the batched legacy migration (manual, rehearsal):
+  Linux/macOS:  ./scripts/run-sql.sh migration/legacy_demo_data.sql
+                ./scripts/run-sql.sh migration/legacy_to_stockmovements_batched.sql
+  Windows:      .\scripts\run-sql.ps1 migration/legacy_demo_data.sql
+                .\scripts\run-sql.ps1 migration/legacy_to_stockmovements_batched.sql
+  (SQL Server must already be running: docker compose up -d sqlserver)
+  Then check in SSMS:  SELECT COUNT(*) FROM dbo.StockMovements;
+                       SELECT * FROM dbo.Legacy_Rejects;   -- 25 bad rows parked, not fatal
+                       SELECT TOP 20 * FROM dbo.MigrationLog ORDER BY LogId DESC;
+  Run it twice: the second run inserts 0 rows (idempotent). Kill it mid-way and re-run: it resumes.
+
+For YOUR real legacy data: load it into dbo.Legacy_StockMovements (same columns), then run
+the migration script. Adjust the CASE mapping on Direction if your codes differ.
+@BatchSize is 1000 on purpose (stays under SQL Server's ~5,000-lock escalation threshold).
+
+Connect with SSMS/Azure Data Studio (dev override only):
+  Server: localhost,1433   Login: sa   Password: your .env value   Trust server certificate: yes
+
+---------------------------------------------------------------------
+6. PHASE 3 - RESILIENCE & BACKGROUND PROCESSING
+---------------------------------------------------------------------
+Every stock movement also writes an outbox row in the same transaction. The background
+OutboxProcessor sends it to the carrier through the Polly pipeline.
+
+See it work:
+  1. POST a few stock movements (section 4).
+  2. GET /api/ops/outbox  -> counts for pending / processing / done / dead.
+  3. docker compose logs -f api   -> see "attempt N failed" warnings and recoveries
+     (mock fails 30% of the time; retries absorb most of it).
+  4. Make the carrier "go down":  set CARRIER_MOCK_FAILURE_RATE=1.0 in .env,
+     docker compose up -d api, post ~10 movements: the circuit breaker opens, messages
+     back off (10s, 20s, 40s... up to 15 min) and eventually become "dead" after MaxAttempts.
+  5. Set it back to 0.0: new messages flow; re-queue dead ones with
+       UPDATE dbo.OutboxMessages SET Status=0, Attempts=0, NextAttemptAt=SYSUTCDATETIME() WHERE Status=3;
+  6. Crash test: docker compose kill api, restart it - nothing is lost (state is in SQL).
+
+Going real: set CARRIER_ENABLE_MOCK=false, CARRIER_BASE_URL=https://your-carrier, then edit
+src/ShipFlow.Api/Resilience/CarrierGateway.cs (path "/_mock/carrier/updates", headers, auth)
+to match the carrier's actual API. Keep the Idempotency-Key header if they support it.
+
+---------------------------------------------------------------------
+7. PHASE 4 - CONSULTING MATERIAL (docs/)
+---------------------------------------------------------------------
+  docs/adr/ADR-001..004     architecture decision records (tenancy, mixed ORM, RCSI, outbox+Polly)
+  docs/consulting/deadlock-case-study.md   full client-escalation walkthrough + email templates
+
+Live deadlock demo (about 5 minutes):
+  1. Load volume:   run migration/legacy_demo_data.sql and the migration script (section 5)
+  2. Open TWO terminals; start both within a few seconds of each other (each runs 90 s):
+     Commands (Windows: .\scripts\run-sql.ps1 with the same relative path):
+       ./scripts/run-sql.sh consulting/deadlock_repro_writer.sql
+       ./scripts/run-sql.sh consulting/deadlock_repro_reader.sql
+     Expect output like "READER finished ... chosen as deadlock victim: 12".
+  3. Inspect graphs:  ./scripts/run-sql.sh consulting/read_deadlock_graph.sql
+     (easier in SSMS/Azure Data Studio: click the XML cell)
+  4. Apply the fix:   ./scripts/run-sql.sh consulting/enable_rcsi.sql
+  5. Repeat step 2: victims should be 0.
+  6. Roll back for the next demo:  ./scripts/run-sql.sh consulting/disable_rcsi.sql
+If step 2 shows 0 victims before the fix, run the two sessions again or load more volume - it is
+timing-dependent but usually reproduces within a minute.
+
+For production: enable RCSI in a maintenance window (it drops open sessions).
+
+---------------------------------------------------------------------
+8. RUNNING THE API WITHOUT DOCKER (optional)
+---------------------------------------------------------------------
+  docker compose up -d sqlserver db-init      (SQL via Docker, published on 1433 by the override)
+  Edit ConnectionStrings:ShipFlow in src/ShipFlow.Api/appsettings.json (real password), then
+  cd src/ShipFlow.Api && dotnet run
+  Carrier:BaseUrl must match the URL "dotnet run" prints (e.g. http://localhost:5xxx) if you use the mock.
+
+---------------------------------------------------------------------
+9. PRODUCTION HARDENING CHECKLIST (do before going live)
+---------------------------------------------------------------------
+[ ] Stop using "sa": run db/ops/create_app_login.sql, switch the connection string to shipflow_app.
+[ ] Secrets out of .env: use Docker/Kubernetes secrets or a vault (Key Vault, AWS Secrets Manager).
+[ ] Replace the X-Tenant-Code header with JWT auth; take the tenant from a validated claim.
+[ ] Use the production compose file only:  docker compose -f docker-compose.yml up -d
+    (no override => SQL port not exposed, backend network isolated).
+[ ] ASPNETCORE_ENVIRONMENT=Production, CARRIER_ENABLE_MOCK=false.
+[ ] Remove or gate db/init/004_seed_dev.sql.
+[ ] TLS: put the API behind a reverse proxy/ingress with HTTPS; use a real SQL certificate
+    and remove TrustServerCertificate=True.
+[ ] Backups: RECOVERY FULL + scheduled log/full backups; test a restore. 001 sets SIMPLE for dev.
+[ ] Persist SQL volume on reliable storage; consider Azure SQL / managed SQL for HA.
+[ ] Add Row-Level Security (see ADR-001) and monitoring/alerts (dead outbox rows, deadlocks, tempdb).
+[ ] Pin image versions (e.g. mssql/server:2022-CU14-ubuntu-22.04) instead of "2022-latest".
+
+---------------------------------------------------------------------
+10. TARGETING .NET 9
+---------------------------------------------------------------------
+  - Dockerfile: change sdk:8.0 -> sdk:9.0 and aspnet:8.0 -> aspnet:9.0
+  - csproj: <TargetFramework>net9.0</TargetFramework>
+  - Bump EF Core to 9.x and Microsoft.Extensions.Http.Resilience to 9.x.
+
+---------------------------------------------------------------------
+11. TROUBLESHOOTING
+---------------------------------------------------------------------
+sqlserver exits at start        -> weak/invalid password, or <2 GB RAM for Docker. docker compose logs sqlserver
+db-init fails                   -> docker compose logs db-init  (the failing script and error are printed)
+"Login failed for user sa"      -> .env password differs from the one the volume was created with.
+                                   Fix: docker compose down -v  (wipes data) and up again.
+api "not-ready" 503             -> db-init did not finish; check logs. /health/ready shows the SQL error.
+400 "Missing X-Tenant-Code"     -> add the header. 403 -> tenant code unknown/inactive.
+Filtered-index / QUOTED_IDENTIFIER errors in your own scripts -> run sqlcmd with -I (our scripts do).
+Build errors on first compile   -> run:  cd src/ShipFlow.Api && dotnet build
+                                   Common fixes: package version bump, missing 'using'. Paste errors to Claude.
+Windows line endings (CRLF) break scripts/run-sql.sh -> use run-sql.ps1, or: dos2unix scripts/run-sql.sh
+
+---------------------------------------------------------------------
+12. PROJECT MAP
+---------------------------------------------------------------------
+  docker-compose.yml / .override.yml   sqlserver + db-init + api, isolated networks
+  Dockerfile                           multi-stage, non-root runtime
+  db/init                              schema + reporting TVFs + seed (auto-applied)
+  db/migration                         legacy staging/demo + batched MERGE migration (manual)
+  db/consulting                        deadlock repro + RCSI scripts (manual)
+  db/ops                               least-privilege login template
+  src/ShipFlow.Api/Domain              entities + movement-type rules
+  src/ShipFlow.Api/Data                EF Core DbContext (tenant filters)
+  src/ShipFlow.Api/Repositories        repository pattern + Dapper report reader
+  src/ShipFlow.Api/Resilience          carrier gateway (Polly pipeline registered in Program.cs)
+  src/ShipFlow.Api/Outbox              persistent queue store + background processor
+  src/ShipFlow.Api/Endpoints           minimal API routes (+ dev mock carrier)
+  docs/                                ADRs and consulting case study
+  requests.http                        ready-to-send sample requests
