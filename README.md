@@ -12,7 +12,7 @@ docker compose up --build
 - Readiness (proves API → SQL via container hostname): http://localhost:8080/health/ready
 - SSMS / Azure Data Studio (dev override): `localhost,1433`, user `sa`
 
-<img src="">
+<img src="Screenshot_2026-11-22_02-46-11.png">
 
 ## Production (no DB port exposed)
 ```bash
