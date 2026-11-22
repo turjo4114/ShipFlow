@@ -1,5 +1,1 @@
-services:
-  sqlserver:
-    ports:
-      - "127.0.0.1:1433:1433"
-    networks: [backend, edge]    # internal networks can't publish ports, so attach edge in dev only
+
